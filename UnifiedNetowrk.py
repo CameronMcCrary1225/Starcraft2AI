@@ -1,0 +1,556 @@
+import os
+import time
+import numpy as np
+import random
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from collections import deque
+from sc2.bot_ai import BotAI
+from sc2.data import Difficulty, Race
+from sc2.main import run_game
+from sc2.player import Bot, Computer
+from sc2 import maps
+from sc2.ids.unit_typeid import UnitTypeId
+from sc2.ids.ability_id import AbilityId
+from sc2.ids.upgrade_id import UpgradeId
+
+class CombinedBot(BotAI):
+    def __init__(self):
+        super().__init__()
+        self.model = self.create_combined_model(input_shape=66, num_actions=10)
+        self.target_model = self.create_combined_model(input_shape=66, num_actions=10)
+        self.target_model.set_weights(self.model.get_weights())
+        self.memory = deque(maxlen=2000)
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.1
+        self.epsilon_decay = 0.995
+        self.batch_size = 32
+        self.update_target_frequency = 10
+        self.total_reward = 0
+        self.last_update_time = time.time()
+        self.update_interval = 30  # Update interval in seconds
+        self.start_time = time.time()
+        self.max_duration = 5 * 60  # 5 minutes
+        self.defend_location = None
+        self.attack_location = None
+        self.last_damage_time = 0
+        self.previous_num_hatcheries = 0
+        self.previous_drones = 0
+        self.total_enemy_health = 0
+        self.total_friendly_health = 0
+        self.last_update_time = time.time()
+        self.update_interval = 1.0  # Adjust as needed
+        self.damage_threshold = 5  # Time in seconds to consider if the base is under attack
+        self.upgrade_tasks = [
+            ("ZERGLINGMOVEMENTSPEED", UnitTypeId.SPAWNINGPOOL, UpgradeId.ZERGLINGMOVEMENTSPEED),
+            ("BANELING_NEST", UnitTypeId.BANELINGNEST, None),
+            ("EVO_CHAMBER", UnitTypeId.EVOLUTIONCHAMBER, None),
+            ("MELEE_UPGRADE_L1", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGMELEEWEAPONSLEVEL1),
+            ("RANGED_UPGRADE_L1", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGMISSILEWEAPONSLEVEL1),
+            ("LAIR", UnitTypeId.LAIR, None),
+            ("HYDRALISK_DEN", UnitTypeId.HYDRALISKDEN, None),
+            ("HYDRALISK_UPGRADE1", UnitTypeId.HYDRALISKDEN, UpgradeId.EVOLVEGROOVEDSPINES),
+            ("EVO_CHAMBER_UPGRADE_L2", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGMELEEWEAPONSLEVEL2),
+            ("EVO_CHAMBER_UPGRADE_R2", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGMISSILEWEAPONSLEVEL2),
+            ("HEALTH_UPGRADE_L1", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGGROUNDARMORSLEVEL1),
+            ("HEALTH_UPGRADE_L2", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGGROUNDARMORSLEVEL2),
+            ("HIVE", UnitTypeId.HIVE, None),
+            ("ADRENALINE_GLANDS", UnitTypeId.SPAWNINGPOOL, UpgradeId.ZERGLINGATTACKSPEED),
+            ("EVO_CHAMBER_UPGRADE_MELEE_L3", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGMELEEWEAPONSLEVEL3),
+            ("EVO_CHAMBER_UPGRADE_RANGED_L3", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGMISSILEWEAPONSLEVEL3),
+            ("HYDRALISK_UPGRADE2", UnitTypeId.HYDRALISKDEN, UpgradeId.EVOLVEMUSCULARAUGMENTS),
+            ("HEALTH_UPGRADE_L3", UnitTypeId.EVOLUTIONCHAMBER, UpgradeId.ZERGGROUNDARMORSLEVEL3),
+        ]
+        self.current_task_index = 0  # To track the current task in the upgrade sequence
+        self.load_model()
+
+    def create_combined_model(self, input_shape, num_actions):
+        model = Sequential()
+        model.add(Dense(64, input_shape=(input_shape,), activation='relu'))
+        model.add(Dense(64, activation='relu'))
+        model.add(Dense(num_actions, activation='linear'))
+        model.compile(optimizer='adam', loss='mse')
+        return model
+
+    async def get_game_state(self):
+        # Macro state features
+        minerals = self.minerals
+        supply_used = self.supply_used
+        supply_cap = self.supply_cap
+        num_drones = len(self.units(UnitTypeId.DRONE))
+        num_queens = len(self.units(UnitTypeId.QUEEN))
+        num_hatcheries = len(self.structures(UnitTypeId.HATCHERY))
+
+        # Micro state features
+        friendly_units_health = []
+        friendly_units_positions = []
+        enemy_units_health = []
+        enemy_units_positions = []
+
+        TOP_N_UNITS = 10
+        for unit in self.units:
+            if len(friendly_units_health) < TOP_N_UNITS:
+                friendly_units_health.append(unit.health)
+                friendly_units_positions.append((unit.position.x, unit.position.y))
+            else:
+                break
+        for unit in self.enemy_units:
+            if len(enemy_units_health) < TOP_N_UNITS:
+                enemy_units_health.append(unit.health)
+                enemy_units_positions.append((unit.position.x, unit.position.y))
+            else:
+                break
+
+        while len(friendly_units_health) < TOP_N_UNITS:
+            friendly_units_health.append(0)
+            friendly_units_positions.append((0, 0))
+        
+        while len(enemy_units_health) < TOP_N_UNITS:
+            enemy_units_health.append(0)
+            enemy_units_positions.append((0, 0))
+
+        friendly_positions_flat = [coord for pos in friendly_units_positions for coord in pos]
+        enemy_positions_flat = [coord for pos in enemy_units_positions for coord in pos]
+
+        # Combine all state features
+        state = np.array([
+            minerals,
+            supply_used,
+            supply_cap,
+            num_drones,
+            num_queens,
+            num_hatcheries
+        ] + friendly_units_health +
+        friendly_positions_flat +
+        enemy_units_health +
+        enemy_positions_flat
+        )
+        state = (state - np.mean(state)) / (np.std(state) + 1e-8)  # Normalize state
+        return state.reshape(1, -1)
+
+    def choose_action(self, state):
+        if np.random.rand() <= self.epsilon:
+            return np.random.randint(10)  # Assuming 10 actions
+        q_values = self.model.predict(state)
+        return np.argmax(q_values[0])
+
+    async def execute_action(self, action):
+        if action == 0:
+            if self.can_afford(UnitTypeId.DRONE):
+                self.train(UnitTypeId.DRONE)
+        elif action == 1:
+            if self.can_afford(UnitTypeId.OVERLORD):
+                self.train(UnitTypeId.OVERLORD)
+        elif action == 2:
+            if self.can_afford(UnitTypeId.QUEEN) and self.structures(UnitTypeId.SPAWNINGPOOL).exists:
+                self.train(UnitTypeId.QUEEN)
+        elif action == 3:
+            await self.build_spawning_pool()
+        elif action == 4:
+            if self.can_afford(UnitTypeId.HATCHERY):
+                await self.expand_now()
+        elif action == 5:
+            await self.build_extractor_and_assign_drones()
+        elif action == 6:
+            await self.train_unit()
+        elif action == 7:
+            await self.upgrade_units()
+        elif action == 8:
+            await self.defend()
+        elif action == 9:
+            await self.attack()
+
+    async def build_spawning_pool(self):
+        if not self.structures(UnitTypeId.HATCHERY).exists:
+            return  # Exit the function if there are no hatcheries
+
+        hatchery = self.townhalls.random
+        if not self.structures(UnitTypeId.SPAWNINGPOOL) and self.already_pending(UnitTypeId.SPAWNINGPOOL) == 0:
+            if self.can_afford(UnitTypeId.SPAWNINGPOOL):
+                await self.build(UnitTypeId.SPAWNINGPOOL, near=hatchery)
+
+    async def build_extractor_and_assign_drones(self):
+        if not self.structures(UnitTypeId.HATCHERY).exists:
+            return
+
+        hatchery = self.townhalls.random
+        vespene_geysers = self.vespene_geyser.closer_than(20, hatchery.position)
+        
+        if not vespene_geysers:
+            return
+
+        for geyser in vespene_geysers:
+            if not self.structures(UnitTypeId.EXTRACTOR).closer_than(1, geyser.position).exists:
+                if self.can_afford(UnitTypeId.EXTRACTOR):
+                    built_extractor = await self.build(UnitTypeId.EXTRACTOR, near=geyser)
+                    break
+
+    async def train_unit(self):
+        # Get counts of current units
+        zerglings_count = len(self.units(UnitTypeId.ZERGLING))
+        hydralisks_count = len(self.units(UnitTypeId.HYDRALISK))
+        banelings_count = len(self.units(UnitTypeId.BANELING))
+
+        # Check for the presence of required buildings
+        has_baneling_nest = self.structures(UnitTypeId.BANELINGNEST).exists
+        has_hydralisk_den = self.structures(UnitTypeId.HYDRALISKDEN).exists
+
+        if not has_baneling_nest and not has_hydralisk_den:
+            # Only train Zerglings if neither building is available
+            target_zerglings = 20
+            target_hydralisks = 0
+            target_banelings = 0
+        elif has_baneling_nest and not has_hydralisk_den:
+            # Train Zerglings and Banelings if Baneling Nest is available but no Hydralisk Den
+            total_units = zerglings_count + banelings_count
+            target_zerglings = int(total_units * 0.70) + max(5, 20 - total_units)  # Ensure at least some Zerglings
+            target_banelings = int(total_units * 0.30)
+            target_hydralisks = 0
+        elif has_baneling_nest and has_hydralisk_den:
+            # Use the 50/30/20 composition if both buildings are available
+            total_units = zerglings_count + hydralisks_count + banelings_count
+            if total_units > 0:
+                target_zerglings = int(total_units * 0.50)
+                target_hydralisks = int(total_units * 0.30)
+                target_banelings = int(total_units * 0.20)
+            else:
+                target_zerglings = 10
+                target_hydralisks = 0
+                target_banelings = 0
+        else:
+            # Default case (shouldn't be reached due to previous conditions)
+            target_zerglings = 20
+            target_hydralisks = 0
+            target_banelings = 0
+
+        # Train or morph units to meet the desired composition
+
+        # Train Zerglings if below the target count
+        if zerglings_count < target_zerglings:
+            if self.can_afford(UnitTypeId.ZERGLING):
+                self.train(UnitTypeId.ZERGLING)
+        
+        # Train Hydralisks if below the target count and Hydralisk Den exists
+        if hydralisks_count < target_hydralisks and has_hydralisk_den:
+            if self.can_afford(UnitTypeId.HYDRALISK):
+                self.train(UnitTypeId.HYDRALISK)
+        
+        # Morph Zerglings into Banelings if below the target count and Baneling Nest exists
+        if banelings_count < target_banelings and has_baneling_nest:
+            zerglings = self.units(UnitTypeId.ZERGLING)
+            if zerglings.exists:
+                for zergling in zerglings:
+                    if self.can_afford(AbilityId.MORPHTOBANELING_BANELING):
+                        self.do(zergling(AbilityId.MORPHTOBANELING_BANELING))
+                        break
+
+
+    async def upgrade_units(self):
+        # Check if there are any more tasks to process
+        if self.current_task_index >= len(self.upgrade_tasks):
+            print("All upgrade tasks are completed.")
+            return
+
+        # Get the current task details
+        task_name, unit_type, upgrade_id = self.upgrade_tasks[self.current_task_index]
+
+        # Handle Hatchery to Lair upgrade
+        if unit_type == UnitTypeId.LAIR and upgrade_id is None:
+            hatcheries = self.structures(UnitTypeId.HATCHERY)
+            if len(hatcheries)>1:
+                hatchery = hatcheries[1]
+                # Check if the bot can afford the upgrade and if it's not already in progress
+                if self.can_afford(UnitTypeId.LAIR):
+                    # Check if the upgrade is already in progress or completed
+                    if not self.structures(UnitTypeId.LAIR).exists and self.already_pending(UnitTypeId.LAIR) == 0:
+                        # Perform the upgrade action
+                        self.do(hatchery(AbilityId.UPGRADETOLAIR_LAIR))
+                        print("Initiating Hatchery to Lair upgrade.")
+                    else:
+                        print(f"{task_name} is under construction. Skipping build initiation.")
+                        return
+                else:
+                    print("Not enough resources or upgrade already completed.")
+                    return
+
+            # Wait for the Lair to be built
+            if self.structures(UnitTypeId.LAIR).exists:
+                print(f"Lair has been built. Moving to next task.")
+                self.current_task_index += 1
+                return
+
+        # Handle Lair to Hive upgrade
+        if unit_type == UnitTypeId.HIVE and upgrade_id is None:
+            lairs = self.structures(UnitTypeId.LAIR)
+            if lairs.exists:
+                lair = lairs.first
+                # Check if the bot can afford the upgrade and if it's not already in progress
+                if self.can_afford(UnitTypeId.HIVE):
+                    if not self.structures(UnitTypeId.HIVE).exists and self.already_pending(UnitTypeId.HIVE) == 0:
+                        # Perform the upgrade action
+                        self.do(lair(AbilityId.UPGRADETOHIVE_HIVE))
+                        print("Initiating Lair to Hive upgrade.")
+                    else:
+                        print(f"{task_name} is under construction. Skipping build initiation.")
+                        return
+                else:
+                    print("Not enough resources or upgrade already completed.")
+                    return
+
+            # Wait for the Hive to be built
+            if self.structures(UnitTypeId.HIVE).exists:
+                print(f"Hive has been built. Moving to next task.")
+                self.current_task_index += 1
+                return
+
+        # Handle building tasks (None means it's an upgrade task)
+        if upgrade_id is None:
+            # Check if the structure is being built or already exists
+            if not self.structures(unit_type).exists:
+                if self.already_pending(unit_type) == 0:
+                    # Attempt to build the structure if it's not present
+                    if self.can_afford(unit_type):
+                        building_type = UnitTypeId(unit_type)
+                        hatchery = self.townhalls.random
+                        await self.build(building_type, near=hatchery)
+                        print(f"Building {task_name}...")
+                    else:
+                        print(f"Not enough resources to build {task_name}.")
+                        return
+                else:
+                    print(f"{task_name} is under construction. Skipping build initiation.")
+                    return
+
+            # Wait for the building to be completed
+            if self.structures(unit_type).exists:
+                print(f"Completed building {task_name}. Moving to next task.")
+                self.current_task_index += 1
+                return
+
+        # Handle upgrade tasks (when upgrade_id is provided)
+        if upgrade_id:
+            building_type = {
+                UpgradeId.ZERGLINGMOVEMENTSPEED: UnitTypeId.SPAWNINGPOOL,
+                UpgradeId.EVOLVEGROOVEDSPINES: UnitTypeId.HYDRALISKDEN,
+                UpgradeId.ZERGMELEEWEAPONSLEVEL1: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGMISSILEWEAPONSLEVEL1: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGGROUNDARMORSLEVEL1: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGMELEEWEAPONSLEVEL2: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGMISSILEWEAPONSLEVEL2: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGGROUNDARMORSLEVEL2: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGMISSILEWEAPONSLEVEL2: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGMELEEWEAPONSLEVEL3: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.ZERGMISSILEWEAPONSLEVEL3: UnitTypeId.EVOLUTIONCHAMBER,
+                UpgradeId.EVOLVEMUSCULARAUGMENTS: UnitTypeId.HYDRALISKDEN,
+                UpgradeId.ZERGLINGATTACKSPEED: UnitTypeId.SPAWNINGPOOL,
+            }.get(upgrade_id, None)
+
+            if building_type is None:
+                print(f"Building type for {task_name} is not recognized. Waiting for correction.")
+                return
+
+            # Check if the required building is present
+            if not self.structures(building_type).exists:
+                print(f"Building for {task_name} is missing. Waiting for construction.")
+                return
+
+            # Get the building where the upgrade should be performed
+            building = self.structures(building_type).first
+
+            # Ensure the building is complete before starting the upgrade
+            if self.already_pending(building_type) > 0:
+                print(f"Building {building_type} is still under construction. Waiting to start upgrade.")
+                return
+
+            # Check if the upgrade is already in progress
+            if self.already_pending_upgrade(upgrade_id) > 0:
+                print(f"Upgrade {task_name} is in progress. Moving to next task.")
+                self.current_task_index += 1
+                return
+
+            # Initiate the upgrade if resources are sufficient
+            if self.can_afford(UpgradeId(upgrade_id)):
+                # Perform the upgrade from the building
+                self.do(building.research(UpgradeId(upgrade_id)))
+                print(f"Started upgrading {task_name}. Moving to next task.")
+                self.current_task_index += 1
+                return
+            else:
+                print(f"Not enough resources to upgrade {task_name}.")
+                return
+
+    async def defend(self):
+        if not self.structures(UnitTypeId.HATCHERY).exists:
+            print("No hatcheries available. Cannot defend.")
+            return
+
+        if self.defend_location is None:
+            self.defend_location = self.start_location
+
+        enemy_units_near_defend_location = [unit for unit in self.enemy_units
+                                            if unit.position.distance_to(self.defend_location) < 10]
+
+        if enemy_units_near_defend_location:
+            hatcheries = self.structures(UnitTypeId.HATCHERY)
+            if not hatcheries.exists:
+                return
+            
+            closest_hatchery = min(hatcheries, key=lambda hatchery: min(unit.position.distance_to(hatchery.position) for unit in enemy_units_near_defend_location))
+
+            for unit in self.units:
+                if unit.type_id not in (UnitTypeId.DRONE, UnitTypeId.OVERLORD):
+                    self.do(unit.attack(closest_hatchery.position))
+        else:
+            for unit in self.units:
+                if unit.type_id not in (UnitTypeId.DRONE, UnitTypeId.OVERLORD):
+                    self.do(unit.attack(self.start_location))
+                    
+    async def attack(self):
+        if self.attack_location is None:
+            # Choose the main base location if no attack location is set
+            self.attack_location = self.enemy_start_locations[0].position
+
+        # Filter out drones and overlords from the list of units to attack
+        attack_units = [unit for unit in self.units if unit.type_id not in (UnitTypeId.DRONE, UnitTypeId.OVERLORD, UnitTypeId.QUEEN)]
+
+        # Retrieve enemy bases
+        enemy_bases = [base for base in self.known_enemy_structures if base.type_id in (UnitTypeId.HATCHERY, UnitTypeId.EXTRACTOR, UnitTypeId.NEXUS, UnitTypeId.COMMANDCENTER)]
+        
+        # Check if there are enemy expansions
+        enemy_expansions = [base for base in enemy_bases if base.position not in [self.attack_location]]
+
+        if enemy_expansions:
+            # If there are enemy expansions, attack the nearest one
+            target = min(enemy_expansions, key=lambda base: self.distance_to(base.position))
+        else:
+            # If no enemy expansions, attack the main base or a random location
+            target = self.attack_location
+
+        for unit in attack_units:
+            # Command each unit to attack the selected target
+            self.do(unit.attack(target))
+    
+    async def calculate_reward(self):
+        reward = 0
+
+        # Macro rewards
+        minerals_collected = self.minerals
+        vespene_collected = self.vespene
+        num_drones = len(self.units(UnitTypeId.DRONE))
+        num_hatcheries = len(self.structures(UnitTypeId.HATCHERY))
+        
+        # Reward for collecting minerals and vespene
+        reward += minerals_collected * 0.1  # Scale this as needed
+        reward += vespene_collected * 0.2  # Scale this as needed
+        
+        # Reward for expanding and building structures
+        if num_hatcheries > self.previous_num_hatcheries:
+            reward += 10  # Reward for expanding
+
+        if num_drones > self.previous_drones:
+            reward += 5  # Reward for increasing drone count
+
+        # Micro rewards
+        friendly_units_health = sum(unit.health for unit in self.units)
+        enemy_units_health = sum(unit.health for unit in self.enemy_units)
+        
+        # Reward for killing enemy units
+        reward += (self.total_enemy_health - enemy_units_health) * 0.1  # Scale as needed
+        
+        # Penalty for losing friendly units
+        reward -= (self.total_friendly_health - friendly_units_health) * 0.05  # Scale as needed
+        
+        # Update stored values
+        self.previous_num_hatcheries = num_hatcheries
+        self.previous_drones = num_drones
+        self.total_enemy_health = enemy_units_health
+        self.total_friendly_health = friendly_units_health
+        
+        return reward
+
+    async def store_experience(self, state, action, reward, next_state):
+        self.memory.append((state, action, reward, next_state))
+        self.total_reward += reward
+
+    async def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+
+        minibatch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states = zip(*minibatch)
+        
+        states = np.array([s.flatten() for s in states])
+        next_states = np.array([s.flatten() for s in next_states])
+        
+        q_values = self.model.predict(states)
+        next_q_values = self.target_model.predict(next_states)
+        
+        for i in range(self.batch_size):
+            target = rewards[i] + self.gamma * np.amax(next_q_values[i])
+            q_values[i][actions[i]] = target
+        
+        self.model.fit(states, q_values, epochs=1, verbose=0)
+        
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def update_target_model(self, iteration):
+        if iteration % self.update_target_frequency == 0:
+            self.target_model.set_weights(self.model.get_weights())
+
+    def save_model(self):
+        self.model.save("combined_model.keras")
+        print("Model saved!")
+
+    def load_model(self):
+        if os.path.exists("combined_model.keras"):
+            self.model = tf.keras.models.load_model("combined_model.keras")
+            self.target_model = self.create_combined_model(input_shape=66, num_actions=10)
+            self.target_model.set_weights(self.model.get_weights())
+            print("Model loaded!")
+        else:
+            print("No pre-trained model found, starting from scratch.")
+
+    async def queen_inject(self):
+        queens = self.units(UnitTypeId.QUEEN)
+        hatcheries = self.structures(UnitTypeId.HATCHERY)
+
+        for queen in queens:
+            if hatcheries:
+                target_hatchery = hatcheries.closest_to(queen)
+                if queen.energy >= 25:
+                    self.do(queen(AbilityId.EFFECT_INJECTLARVA, target_hatchery))
+
+    async def on_step(self, iteration: int):
+        state = await self.get_game_state()
+        action = self.choose_action(state)
+        await self.execute_action(action)
+
+        reward = await self.calculate_reward()
+        next_state = await self.get_game_state()
+        await self.store_experience(state, action, reward, next_state)
+
+        # Train the model every 500 iterations
+        if iteration % 250 == 0:
+            await self.replay()
+            self.update_target_model(iteration)
+            if iteration % 500 == 0:
+                self.save_model()
+
+        self.last_update_time = time.time()
+
+        if iteration % 20 == 0:
+            await self.distribute_workers()
+            await self.queen_inject()
+
+def run_multiple_games(num_games):
+    for _ in range(num_games):
+        run_game(maps.get("AbyssalReefLE"), [
+            Bot(Race.Zerg, CombinedBot()),
+            Computer(Race.Terran, Difficulty.Easy)],
+            realtime= False)
+
+if __name__ == "__main__":
+    run_multiple_games(1)
