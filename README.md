@@ -18,9 +18,8 @@ However, due to communication issues between these networks, the project was sim
 - **Performance**: Despite training limitations, the AI can still make decisions faster than a human player going against it.
 
 ## Installation
-1. Clone the repository to your local machine:
-   ```bash
-   git clone https://github.com/username/Starcraft2-AI.git
+Clone the repository to your local machine:
+
 Install the necessary Python libraries:
   - pip install tensorflow sc2 numpy
   
